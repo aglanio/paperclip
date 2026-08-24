@@ -243,6 +243,7 @@ import {
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
+  backfillRunSourceIssueFromCheckout,
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
   observeCrossIssueInfluence,
@@ -10693,6 +10694,20 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     if (updated?.harnessKind === "skill_test") {
       await companySkillsSvc.markTestRunRunning(updated.companyId, updated.id);
+    }
+
+    // A timer/unassigned run has no source issue in its snapshot; claim it so
+    // the agent's post-checkout writes to this issue are same-source instead of
+    // spending (or, pre-WORA-770, being hard-denied by) the cross-issue cap.
+    // Scoped wakes keep their original source issue. Best-effort: the cap
+    // backstop still bounds writes even if the back-fill fails.
+    if (req.actor.type === "agent" && checkoutRunId) {
+      await backfillRunSourceIssueFromCheckout(db, {
+        companyId: issue.companyId,
+        runId: checkoutRunId,
+        agentId: req.body.agentId,
+        issueId: issue.id,
+      }).catch((err) => logger.warn({ err, issueId: issue.id, runId: checkoutRunId }, "failed to backfill run source issue on checkout"));
     }
 
     await logActivity(db, {
