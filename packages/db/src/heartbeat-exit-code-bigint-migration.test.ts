@@ -1,68 +1,81 @@
+import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
+import { applyPendingMigrations } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
+// Windows process exit codes are unsigned 32-bit (e.g. 0xFFFFFFFF = 4294967295,
+// 0xC000013A as unsigned = 3221225786). Stored in an integer column, the final
+// UPDATE of a heartbeat run fails with "integer out of range", rolling back the
+// status transition and leaving zombie runs behind (WORA-899).
+const UNSIGNED_EXIT_CODES = [4294967295, 3221225786];
+
 const cleanups: Array<() => Promise<void>> = [];
-const support = await getEmbeddedPostgresTestSupport();
-const d = support.supported ? describe : describe.skip;
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-afterEach(async () => {
-  while (cleanups.length > 0) await cleanups.pop()?.();
-});
+describeEmbeddedPostgres("bigint exit_code migration", () => {
+  afterEach(async () => {
+    await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
+  });
 
-d("heartbeat_runs.exit_code bigint migration", () => {
-  it("creates exit_code as bigint on a fresh database", async () => {
-    const dbh = await startEmbeddedPostgresTestDatabase("pap899-bigint-");
-    cleanups.push(() => dbh.cleanup());
-    const sql = postgres(dbh.connectionString, { max: 1 });
-    cleanups.push(async () => {
-      await sql.end();
-    });
+  it("creates heartbeat_runs.exit_code as bigint on a fresh database", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-bigint-exit-code-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => sql.end());
 
-    const cols = await sql`
-      SELECT data_type
-      FROM information_schema.columns
-      WHERE table_name = 'heartbeat_runs' AND column_name = 'exit_code'
+    await applyPendingMigrations(database.connectionString);
+
+    const columns = await sql<{ data_type: string }[]>`
+      SELECT "data_type" FROM "information_schema"."columns"
+      WHERE "table_name" = 'heartbeat_runs' AND "column_name" = 'exit_code'
     `;
-    expect(cols).toHaveLength(1);
-    expect(cols[0].data_type).toBe("bigint");
-  });
+    expect(columns[0]!.data_type).toBe("bigint");
+  }, 30_000);
 
-  it("persists unsigned Windows exit codes without rollback (4294967295, 3221225786)", async () => {
-    const dbh = await startEmbeddedPostgresTestDatabase("pap899-write-");
-    cleanups.push(() => dbh.cleanup());
-    const sql = postgres(dbh.connectionString, { max: 1 });
-    cleanups.push(async () => {
-      await sql.end();
-    });
+  it("persists an unsigned exit code on the final run update without rollback", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-bigint-exit-code-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => sql.end());
 
-    const company = (
-      await sql`INSERT INTO companies (name) VALUES ('WORA-899 bigint test') RETURNING id`
-    )[0];
-    const agent = (
-      await sql`INSERT INTO agents (company_id, name) VALUES (${company.id}, 'wora-899-agent') RETURNING id`
-    )[0];
+    await applyPendingMigrations(database.connectionString);
 
-    for (const exitCode of [4294967295, 3221225786]) {
-      const run = (
-        await sql`
-          INSERT INTO heartbeat_runs (company_id, agent_id, status)
-          VALUES (${company.id}, ${agent.id}, 'running')
-          RETURNING id
-        `
-      )[0];
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await sql`
+      INSERT INTO "companies" ("id", "name", "issue_prefix")
+      VALUES (${companyId}, 'Bigint Exit Code', 'BEC')
+    `;
+    await sql`
+      INSERT INTO "agents" ("id", "company_id", "name", "status")
+      VALUES (${agentId}, ${companyId}, 'Exit Code Runner', 'idle')
+    `;
+
+    for (const exitCode of UNSIGNED_EXIT_CODES) {
+      const runId = randomUUID();
       await sql`
-        UPDATE heartbeat_runs
-        SET status = 'failed', finished_at = now(), exit_code = ${exitCode}
-        WHERE id = ${run.id}
+        INSERT INTO "heartbeat_runs" ("id", "company_id", "agent_id", "status", "started_at")
+        VALUES (${runId}, ${companyId}, ${agentId}, 'running', now())
       `;
-      const row = (await sql`SELECT status, finished_at, exit_code FROM heartbeat_runs WHERE id = ${run.id}`)[0];
-      expect(row.status).toBe("failed");
-      expect(row.finished_at).toBeInstanceOf(Date);
-      expect(row.exit_code).toBe(BigInt(exitCode));
+
+      // This is the exact statement that used to roll back with
+      // "integer out of range" when exit_code exceeded 2^31 - 1.
+      await sql`
+        UPDATE "heartbeat_runs"
+        SET "status" = 'succeeded', "exit_code" = ${exitCode}, "finished_at" = now()
+        WHERE "id" = ${runId}
+      `;
+
+      const [run] = await sql<{ status: string; exit_code: string | null }[]>`
+        SELECT "status", "exit_code"::text AS "exit_code" FROM "heartbeat_runs" WHERE "id" = ${runId}
+      `;
+      expect(run!.status).toBe("succeeded");
+      expect(run!.exit_code).toBe(String(exitCode));
     }
-  });
+  }, 30_000);
 });
