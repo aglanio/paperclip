@@ -14,7 +14,6 @@ import {
   AlertTriangle,
   ChevronRight,
 } from "lucide-react";
-import { buildAgentTree, type AgentTreeNode } from "./agentTree";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
 import { useSidebar } from "../context/SidebarContext";
@@ -50,6 +49,7 @@ import { BudgetSidebarMarker } from "./BudgetSidebarMarker";
 import { SidebarNavItem } from "./SidebarNavItem";
 import { SidebarSection, type SidebarSectionRadioChoice } from "./SidebarSection";
 import { StarToggle } from "./StarToggle";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -59,7 +59,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { Agent } from "@paperclipai/shared";
+import { AGENT_ROLE_LABELS, AGENT_ROLES, type Agent, type AgentRole } from "@paperclipai/shared";
 
 /**
  * When no agent is running, the sidebar falls back to showing at most this many
@@ -326,14 +326,12 @@ function SidebarAgentItem({
 
 export function SidebarAgents({ streamlined = false }: { streamlined?: boolean } = {}) {
   const [open, setOpen] = useState(true);
-  // Org-tree: which CEO/manager nodes are collapsed (session-scoped). Default is
-  // expanded, so the hierarchy is visible without a click.
-  const [collapsedNodeIds, setCollapsedNodeIds] = useState<Set<string>>(() => new Set());
-  const toggleNodeCollapsed = useCallback((agent: Agent) => {
-    setCollapsedNodeIds((prev) => {
+  const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(() => new Set());
+  const toggleAgentCollapsed = useCallback((agentId: string) => {
+    setCollapsedAgents((prev) => {
       const next = new Set(prev);
-      if (next.has(agent.id)) next.delete(agent.id);
-      else next.add(agent.id);
+      if (next.has(agentId)) next.delete(agentId);
+      else next.add(agentId);
       return next;
     });
   }, []);
@@ -653,7 +651,7 @@ export function SidebarAgents({ streamlined = false }: { streamlined?: boolean }
   const renderAgentRow = (
     agent: Agent,
     isStarredRow: boolean,
-    tree?: { depth: number; hasReports: boolean; expanded: boolean },
+    tree?: { depth: number; hasReports: boolean; expanded: boolean; onToggleExpand: (agent: Agent) => void },
   ) => (
     <SidebarAgentItem
       key={agent.id}
@@ -675,28 +673,56 @@ export function SidebarAgents({ streamlined = false }: { streamlined?: boolean }
       depth={tree?.depth ?? 0}
       hasReports={tree?.hasReports ?? false}
       expanded={tree?.expanded ?? true}
-      onToggleExpand={tree ? toggleNodeCollapsed : undefined}
+      onToggleExpand={tree?.onToggleExpand}
     />
   );
 
-  // Org tree (CEOs → reports) built from the flat non-starred list. Falls back to
-  // a flat list in the collapsed rail and in streamlined mode, where a nested
-  // tree has no room / doesn't fit the "recent few" affordance.
-  const agentTree = useMemo(
-    () => buildAgentTree(dedupedDisplayedAgents),
-    [dedupedDisplayedAgents],
+  // Group displayed agents into a hierarchical org tree.
+  // We use sortedAgents directly to bypass the 'streamlined' truncation, so the full tree is explorable.
+  const treeBaseAgents = useMemo(
+    () => sortedAgents.filter((agent: Agent) => !starredAgentIdSet.has(agent.id)),
+    [sortedAgents, starredAgentIdSet]
   );
-  const useTreeLayout = !rail && !streamlined;
-  const renderAgentTree = (nodes: AgentTreeNode[]): ReactNode[] =>
-    nodes.flatMap((node) => {
-      const hasReports = node.reports.length > 0;
-      const expanded = !collapsedNodeIds.has(node.agent.id);
-      const rows: ReactNode[] = [
-        renderAgentRow(node.agent, false, { depth: node.depth, hasReports, expanded }),
-      ];
-      if (hasReports && expanded) rows.push(...renderAgentTree(node.reports));
-      return rows;
-    });
+
+  const agentsMap = useMemo(() => new Map(treeBaseAgents.map(a => [a.id, a])), [treeBaseAgents]);
+
+  const rootAgents = useMemo(() => {
+    return treeBaseAgents.filter(a => !a.reportsTo || !agentsMap.has(a.reportsTo));
+  }, [treeBaseAgents, agentsMap]);
+
+  const childrenMap = useMemo(() => {
+    const map = new Map<string, Agent[]>();
+    for (const agent of treeBaseAgents) {
+      const parentId = agent.reportsTo;
+      if (parentId && agentsMap.has(parentId)) {
+        if (!map.has(parentId)) map.set(parentId, []);
+        map.get(parentId)!.push(agent);
+      }
+    }
+    return map;
+  }, [treeBaseAgents, agentsMap]);
+
+  const renderAgentTree = (agent: Agent, depth: number): ReactNode => {
+    const children = childrenMap.get(agent.id) || [];
+    const hasReports = children.length > 0;
+    const isExpanded = !collapsedAgents.has(agent.id);
+
+    return (
+      <div key={agent.id}>
+        {renderAgentRow(agent, false, {
+          depth,
+          hasReports,
+          expanded: isExpanded,
+          onToggleExpand: (a) => toggleAgentCollapsed(a.id)
+        })}
+        {hasReports && isExpanded && (
+          <div className="flex flex-col">
+            {children.map(child => renderAgentTree(child, depth + 1))}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <SidebarSection
@@ -720,9 +746,7 @@ export function SidebarAgents({ streamlined = false }: { streamlined?: boolean }
       }}
     >
       {starredAgents.map((agent: Agent) => renderAgentRow(agent, true))}
-      {useTreeLayout
-        ? renderAgentTree(agentTree)
-        : dedupedDisplayedAgents.map((agent: Agent) => renderAgentRow(agent, false))}
+      {rootAgents.map(agent => renderAgentTree(agent, 0))}
       {showSeeAllLink && (() => {
         // Deliberately NOT a SidebarNavItem: this is a quiet muted affordance
         // (plain Link) that must not adopt nav-row active-route highlighting.

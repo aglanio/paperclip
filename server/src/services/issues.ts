@@ -8532,6 +8532,9 @@ export function issueService(db: Db) {
 
       const conditions = [eq(issueComments.issueId, issueId)];
       if (afterCommentId) {
+        // Same malformed-id rule as getComment: a non-UUID cursor is simply an
+        // empty page, never a failed query.
+        if (!isUuidLike(afterCommentId)) return [];
         const anchor = await db
           .select({
             id: issueComments.id,
@@ -8609,6 +8612,9 @@ export function issueService(db: Db) {
     },
 
     getComment: async (commentId: string) => {
+      // A non-UUID path segment must read as "not found", not as a failed
+      // query (a malformed id once surfaced as a 500 with a Drizzle stack).
+      if (!isUuidLike(commentId)) return null;
       const { censorUsernameInLogs } = await instanceSettings.getGeneral();
       const comment = await db
         .select()
@@ -8621,6 +8627,7 @@ export function issueService(db: Db) {
     },
 
     removeComment: async (commentId: string) => {
+      if (!isUuidLike(commentId)) return null;
       const currentUserRedactionOptions = {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
@@ -8657,6 +8664,7 @@ export function issueService(db: Db) {
       const currentUserRedactionOptions = {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
+      if (!isUuidLike(commentId)) return null;
 
       return db.transaction(async (tx) => {
         const now = new Date();
@@ -8829,6 +8837,7 @@ export function issueService(db: Db) {
       if (!issue) throw notFound("Issue not found");
 
       if (input.issueCommentId) {
+        if (!isUuidLike(input.issueCommentId)) throw notFound("Issue comment not found");
         const comment = await db
           .select({ id: issueComments.id, companyId: issueComments.companyId, issueId: issueComments.issueId })
           .from(issueComments)

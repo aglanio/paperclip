@@ -1,0 +1,2 @@
+# Migration hashes are content-based: CRLF checkout invalidates every journal entry.
+packages/db/src/migrations/*.sql text eol=lf

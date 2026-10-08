@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
@@ -2348,6 +2349,69 @@ export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
   return env;
 }
 
+// WORA-1301: the server stamps PAPERCLIP_LISTEN_PORT / PAPERCLIP_API_URL into its
+// own process env at boot, and when the requested port is busy it silently binds
+// the next free port instead (see @paperclipai/server index.ts "Requested port is
+// busy; using next free port"). sanitizeInheritedPaperclipEnv deliberately keeps
+// those runtime vars when propagating the server env to adapter children, so a
+// child spawned by a SECOND server instance (bound to e.g. :3101) inherits an API
+// URL that points at that second instance. If the second server later dies
+// (memory-guard kill, crash), every run it spawned is stranded with a dead
+// PAPERCLIP_API_URL and receives instant connection-refused. The guard below
+// re-validates the inherited URL at spawn time: loopback URLs get a quick TCP
+// connect probe; when nothing accepts, the URL is discarded and the child falls
+// back to the default derived from PAPERCLIP_LISTEN_PORT/PORT (typically :3100),
+// which stays correct because the primary server never abandons its port.
+export async function revalidateInheritedPaperclipApiUrl(
+  env: Record<string, string>,
+  opts: { probeTimeoutMs?: number; onUnreachable?: (inheritedUrl: string, fallbackUrl: string | null) => void } = {},
+): Promise<Record<string, string>> {
+  const inherited = env.PAPERCLIP_API_URL;
+  if (!inherited) return env;
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 800;
+  // Only loopback URLs are probed: an explicit public/remote base URL (VPN,
+  // tailnet, LAN) is authoritative config, not a stale server-port echo.
+  let parsed: URL;
+  try {
+    parsed = new URL(inherited);
+  } catch {
+    return env;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return env;
+  const host = parsed.hostname;
+  if (host !== "localhost" && host !== "127.0.0.1" && host !== "127.1" && host !== "::1" && host !== "[::1]") {
+    return env;
+  }
+  const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+  if (!Number.isFinite(port)) return env;
+
+  const reachable = await probeLoopbackPort(host === "::1" || host === "[::1]" ? "::1" : "127.0.0.1", port, probeTimeoutMs);
+  if (reachable) return env;
+
+  // Unreachable: drop the stale URL and re-derive from LISTEN_PORT/PORT so the
+  // child falls back to the primary server.
+  const fallbackPort = env.PAPERCLIP_LISTEN_PORT ?? env.PORT ?? "3100";
+  const fallbackUrl = `http://localhost:${fallbackPort}`;
+  if (opts.onUnreachable) opts.onUnreachable(inherited, fallbackUrl);
+  env.PAPERCLIP_API_URL = fallbackUrl;
+  return env;
+}
+
+function probeLoopbackPort(host: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    const finish = (ok: boolean) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
 export function defaultPathForPlatform() {
   if (process.platform === "win32") {
     return "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem";
@@ -3304,6 +3368,27 @@ export async function runChildProcess(
   },
 ): Promise<RunProcessResult> {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
+
+  // WORA-1301: before merging env and spawning, re-validate the PAPERCLIP_API_URL
+  // that buildPaperclipEnv stamped from the server's own process.env. If the server
+  // inherited a stale PAPERCLIP_API_URL (e.g. from a parent watchdog whose env was
+  // contaminated by a dead second-instance server), the inherited URL may point at a
+  // port that no longer has anything listening. The probe below checks reachability
+  // for loopback URLs; if unreachable the URL is re-derived from the server's own
+  // bound LISTEN_PORT, which is always correct for this process.
+  if (!opts.remoteExecution) {
+    await revalidateInheritedPaperclipApiUrl(opts.env, {
+      probeTimeoutMs: 800,
+      onUnreachable: (inherited, fallback) => {
+        onLogError(
+          new Error(`WORA-1301: inherited PAPERCLIP_API_URL=${inherited} unreachable — falling back to ${fallback}`),
+          runId,
+          "WORA-1301: PAPERCLIP_API_URL was stale; re-derived from LISTEN_PORT",
+        );
+      },
+    });
+  }
+
   return new Promise<RunProcessResult>((resolve, reject) => {
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),

@@ -235,7 +235,7 @@ export async function backfillRunSourceIssueFromCheckout(
             jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb), '{issueId}', to_jsonb(${input.issueId}::text), true),
             '{taskId}',
             to_jsonb(${input.issueId}::text),
-            true
+<            true,
           )
         else ${heartbeatRuns.contextSnapshot}
       end`,

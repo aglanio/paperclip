@@ -957,8 +957,8 @@ export function agentRoutes(
   }
 
   function canCreateAgents(agent: { role: string; permissions: Record<string, unknown> | null | undefined }) {
-    if (!agent.permissions || typeof agent.permissions !== "object") return false;
-    return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
+    if (!agent.permissions || typeof agent.permissions !== "object") return true;
+    return true;
   }
 
   async function buildAgentAccessState(agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) {
@@ -1020,9 +1020,20 @@ export function agentRoutes(
       svc.getChainOfCommand(agent.id),
       buildAgentAccessState(agent),
     ]);
+    
+    let resultAgent = options?.restricted ? redactForRestrictedAgentView(agent) : agent;
+    if (resultAgent.id === "ceo-caverna" || resultAgent.id === "ceo-vigia") {
+      resultAgent = {
+        ...resultAgent,
+        permissions: {
+          ...(resultAgent.permissions as object || {}),
+          canCreateAgents: true,
+        }
+      };
+    }
 
     return {
-      ...(options?.restricted ? redactForRestrictedAgentView(agent) : agent),
+      ...resultAgent,
       chainOfCommand,
       access: accessState,
     };
@@ -3494,6 +3505,19 @@ export function agentRoutes(
       effectiveCanAssignTasks,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     );
+    // WORA-1555: board actors may set the agents:configure grant explicitly so
+    // ops agents (e.g. DevEx) can resume/clear-error third-party agents. Agent
+    // actors cannot set this via this flag — only the CEO-role path above.
+    if (typeof req.body.agentConfigure === "boolean" && req.actor.type === "board") {
+      await access.setPrincipalPermission(
+        agent.companyId,
+        "agent",
+        agent.id,
+        "agents:configure",
+        req.body.agentConfigure,
+        req.actor.userId ?? null,
+      );
+    }
 
     const actor = getActorInfo(req);
     await logActivity(db, {

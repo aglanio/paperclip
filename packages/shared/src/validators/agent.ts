@@ -237,6 +237,9 @@ export const updateAgentPermissionsSchema = z.object({
   canAssignTasks: z.boolean(),
   trustPreset: trustPresetSchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
+  // WORA-1555: board-level path to grant agents:configure (needed for
+  // third-party agent resume/clear-error by ops agents like DevEx).
+  agentConfigure: z.boolean().optional(),
 });
 
 export type UpdateAgentPermissions = z.infer<typeof updateAgentPermissionsSchema>;
